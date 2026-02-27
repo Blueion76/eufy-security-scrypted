@@ -5,7 +5,7 @@
  * Manages child device registration, station alarm/guard mode, and station configuration.
  */
 
-import {
+import sdk, {
   DeviceProvider,
   Reboot,
   Refresh,
@@ -38,6 +38,8 @@ import {
   DeviceUtils,
   securitySystemMap,
 } from "./utils/device-utils";
+
+const { deviceManager } = sdk;
 
 // Helper to create a transport function for routing tslog to Scrypted console
 function createConsoleTransport(console: Console) {
@@ -137,6 +139,13 @@ export class EufyStation
 
     // Begin loading initial properties
     this.propertiesLoaded = this.loadInitialProperties();
+
+    // Pre-declare all child devices belonging to this station so Scrypted can
+    // match their nativeIds against its persisted database and preserve numeric
+    // device IDs across plugin restarts / container reboots.
+    this.loadChildDevices().catch((err) => {
+      this.logger.warn(`Failed to pre-declare child devices: ${err}`);
+    });
   }
 
   private async loadInitialProperties() {
@@ -145,6 +154,63 @@ export class EufyStation
       this.updateStateFromProperties(this.latestProperties);
     } catch (e) {
       this.logger.warn(`Failed to load initial properties: ${e}`);
+    }
+  }
+
+  /**
+   * Fetch all devices that belong to this station and register them with
+   * Scrypted via onDevicesChanged.  This runs eagerly in the constructor so
+   * that Scrypted sees the nativeIds immediately and can reuse the numeric
+   * device IDs it already has stored — preventing cameras from becoming
+   * unlinked from NVR on every restart.
+   */
+  private async loadChildDevices(): Promise<void> {
+    try {
+      // Ask the WS server for the list of all device serials, then filter to
+      // those whose stationSerialNumber matches this station.
+      const allDevices = await this.wsClient.commands
+        .devices()
+        .getSerialNumbers();
+
+      const childSerials: string[] = [];
+      for (const serial of allDevices) {
+        try {
+          const props = (
+            await this.wsClient.commands.device(serial).getProperties()
+          ).properties;
+          if (props.stationSerialNumber === this.serialNumber) {
+            childSerials.push(serial);
+          }
+        } catch (e) {
+          this.logger.warn(
+            `Could not fetch properties for device ${serial}: ${e}`
+          );
+        }
+      }
+
+      if (childSerials.length === 0) {
+        this.logger.debug(`No child devices found for station ${this.nativeId}`);
+        return;
+      }
+
+      // Build manifests concurrently, then register them all at once so
+      // Scrypted gets a single authoritative list for this station.
+      const manifests = await Promise.all(
+        childSerials.map((serial) =>
+          DeviceUtils.createDeviceManifest(this.wsClient, serial)
+        )
+      );
+
+      await deviceManager.onDevicesChanged({
+        providerNativeId: this.nativeId,
+        devices: manifests,
+      });
+
+      this.logger.info(
+        `✅ Pre-declared ${manifests.length} child device(s) for station ${this.nativeId}`
+      );
+    } catch (err) {
+      this.logger.warn(`loadChildDevices failed for ${this.nativeId}: ${err}`);
     }
   }
 

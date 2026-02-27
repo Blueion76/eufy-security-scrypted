@@ -822,6 +822,16 @@ export class EufySecurityProvider
 
   /**
    * Register devices from the server state.
+   *
+   * FIX: Previously used forEach + floating .then() (fire-and-forget), which meant
+   * manifests were not awaited before Scrypted called getDevice(). This caused a race
+   * where Scrypted would see a nativeId for the first time mid-flight and assign a
+   * brand-new numeric device ID rather than reusing the persisted one.
+   *
+   * Now we build all manifests concurrently but await each onDevicesChanged call so
+   * every device is fully registered before we return — giving Scrypted the chance to
+   * match nativeIds against its persisted database and keep the same numeric IDs.
+   *
    * @param serverState - StartListeningResponse from the server.
    * @returns {Promise<void>}
    */
@@ -840,13 +850,21 @@ export class EufySecurityProvider
       return;
     }
 
-    deviceSerials.forEach((deviceSerial) =>
-      DeviceUtils.createDeviceManifest(this.wsClient, deviceSerial).then(
-        (manifest) =>
-          deviceManager.onDevicesChanged({
-            providerNativeId: manifest.providerNativeId,
-            devices: [manifest],
-          })
+    // Build all manifests concurrently, then register each one and await it.
+    // Awaiting onDevicesChanged ensures Scrypted persists the nativeId→deviceId
+    // mapping before we proceed, so numeric IDs are stable across restarts.
+    const manifests = await Promise.all(
+      deviceSerials.map((serial) =>
+        DeviceUtils.createDeviceManifest(this.wsClient, serial)
+      )
+    );
+
+    await Promise.all(
+      manifests.map((manifest) =>
+        deviceManager.onDevicesChanged({
+          providerNativeId: manifest.providerNativeId,
+          devices: [manifest],
+        })
       )
     );
 
