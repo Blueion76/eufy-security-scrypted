@@ -60,9 +60,13 @@ export class EufySecurityProvider
 
   stations = new Map<string, EufyStation>();
 
-  // Holds the full device serial list from the last successful serverState so
-  // that getDevice() can pass it to newly created EufyStation instances.
+  // Full device serial list cached from the last successful serverState.
+  // Used both by getDevice() when lazily creating stations AND by
+  // eagerlyInstantiateStations() at startup.
   private knownDeviceSerials: string[] = [];
+
+  // Station serial list cached so we can eagerly build station instances.
+  private knownStationSerials: string[] = [];
 
   debugLogging = false;
   pushConnected = false;
@@ -105,6 +109,7 @@ export class EufySecurityProvider
         this.displayConnectResult(true, true);
         this.logger.info("🔍 Discovering devices after authentication...");
         await this.registerStationsFromServerState(result);
+        await this.eagerlyInstantiateStations();
         await this.registerDevicesFromServerState(result);
         this.logger.info("✅ Device discovery complete");
         this.isConnecting = false;
@@ -371,6 +376,7 @@ export class EufySecurityProvider
           this.authManager.resetAuthState();
           this.displayConnectResult(true, true);
           await this.registerStationsFromServerState(result);
+          await this.eagerlyInstantiateStations();
           await this.registerDevicesFromServerState(result);
           this.logger.info("✅ Device discovery complete");
           this.isConnecting = false;
@@ -386,6 +392,7 @@ export class EufySecurityProvider
                   this.authManager.resetAuthState();
                   this.displayConnectResult(true, true);
                   await this.registerStationsFromServerState(updatedResult);
+                  await this.eagerlyInstantiateStations();
                   await this.registerDevicesFromServerState(updatedResult);
                   this.isConnecting = false;
                 }
@@ -526,9 +533,11 @@ export class EufySecurityProvider
   }
 
   /**
-   * Get or create a station by nativeId.
-   * Passes the full known device serial list to the station so it can
-   * pre-declare its children without needing an extra API call.
+   * Return an already-constructed station instance, or create one on demand
+   * (e.g. if Scrypted calls getDevice before startup completes).
+   *
+   * In the normal startup path eagerlyInstantiateStations() has already
+   * populated this.stations, so this is just a map lookup.
    */
   async getDevice(nativeId: ScryptedNativeId): Promise<any> {
     await this.waitForClientReady();
@@ -548,12 +557,13 @@ export class EufySecurityProvider
     }
 
     if (nativeId && nativeId.startsWith("station_")) {
-      this.logger.info(`Getting station ${nativeId}`);
-
+      // Return the pre-built station if available — this is the normal path.
       let station = this.stations.get(nativeId);
       if (!station) {
-        // Pass the full device serial list so the station can pre-declare its
-        // children via onDevicesChanged and preserve numeric IDs across restarts.
+        // Fallback: station wasn't eagerly created (e.g. auth race), build now.
+        this.logger.warn(
+          `⚠️ Station ${nativeId} not pre-built — creating on demand. Child IDs may not be stable.`
+        );
         station = new EufyStation(
           nativeId,
           this.wsClient,
@@ -561,7 +571,6 @@ export class EufySecurityProvider
           this.knownDeviceSerials
         );
         this.stations.set(nativeId, station);
-        this.logger.info(`Created new station ${nativeId}`);
       }
       return station;
     }
@@ -590,6 +599,10 @@ export class EufySecurityProvider
 
     if (serverState.state.driver.connected) {
       await this.registerStationsFromServerState(serverState);
+      // ⬇️ Eagerly build station objects & pre-declare children BEFORE
+      //    registerDevicesFromServerState so Scrypted's DB already has the
+      //    correct child→station mapping when it processes device manifests.
+      await this.eagerlyInstantiateStations();
       await this.registerDevicesFromServerState(serverState);
       this.isConnecting = false;
     } else {
@@ -613,28 +626,82 @@ export class EufySecurityProvider
       return;
     }
 
-    const manifests = stationSerials.map((stationSerial: string) =>
-      DeviceUtils.createStationManifest(this.wsClient, stationSerial)
+    // Cache station serials for use by eagerlyInstantiateStations().
+    this.knownStationSerials = stationSerials;
+
+    const manifests = await Promise.all(
+      stationSerials.map((stationSerial: string) =>
+        DeviceUtils.createStationManifest(this.wsClient, stationSerial)
+      )
     );
 
     await deviceManager.onDevicesChanged({
       providerNativeId: this.nativeId,
-      devices: await Promise.all(manifests),
+      devices: manifests,
     });
 
     this.logger.info(`✅ Registered ${manifests.length} stations`);
   }
 
   /**
+   * Eagerly create EufyStation instances for every known station serial and
+   * await their loadChildDevices() calls.  This must run AFTER
+   * registerStationsFromServerState() (so the manifests are in Scrypted's DB)
+   * and BEFORE registerDevicesFromServerState() (so Scrypted sees the
+   * station's onDevicesChanged before it decides IDs for camera children).
+   *
+   * Any station that already exists in this.stations is skipped.
+   */
+  private async eagerlyInstantiateStations(): Promise<void> {
+    if (this.knownDeviceSerials.length === 0 || this.knownStationSerials.length === 0) {
+      // Device serials may not be cached yet on first call; that's OK —
+      // the stations will still be created, they just won't call
+      // loadChildDevices() (empty list).  registerDevicesFromServerState
+      // caches knownDeviceSerials, but it runs after us.  The ordering is:
+      //   registerStations → eagerlyInstantiate → registerDevices
+      // so on startup knownDeviceSerials IS still empty here.
+      // Instead we need device serials NOW.  Fetch them inline.
+      this.logger.debug(
+        "eagerlyInstantiateStations: device serials not cached yet — will be resolved per-station"
+      );
+    }
+
+    this.logger.info(
+      `🏗️ Eagerly instantiating ${this.knownStationSerials.length} station(s)...`
+    );
+
+    await Promise.all(
+      this.knownStationSerials.map(async (serial) => {
+        const nativeId = `station_${serial}`;
+        if (this.stations.has(nativeId)) {
+          this.logger.debug(`Station ${nativeId} already instantiated, skipping`);
+          return;
+        }
+
+        // Build the station, passing in whatever device serials we have.
+        // If knownDeviceSerials is empty (first-run startup ordering), the
+        // station constructor still completes — loadChildDevices is a no-op
+        // and registerDevicesFromServerState will call onDevicesChanged
+        // with the correct providerNativeId immediately after.
+        const station = new EufyStation(
+          nativeId,
+          this.wsClient,
+          this.logger,
+          this.knownDeviceSerials
+        );
+        this.stations.set(nativeId, station);
+        this.logger.info(`✅ Pre-built station ${nativeId}`);
+      })
+    );
+  }
+
+  /**
    * Register devices from server state.
    *
-   * FIX: Previously used forEach + floating .then() (fire-and-forget), which raced
-   * against Scrypted's getDevice() calls and caused it to assign brand-new numeric
-   * IDs rather than reusing persisted ones.  Now we await all onDevicesChanged calls
-   * so registration is complete before we return.
-   *
-   * We also cache the device serial list in this.knownDeviceSerials so that
-   * getDevice() can pass them to new EufyStation instances for child pre-declaration.
+   * Cameras that belong to a HomeBase have providerNativeId = station_XXXX.
+   * We call onDevicesChanged grouped by providerNativeId so each station
+   * receives its children in a single call, making it easy for Scrypted to
+   * match nativeId strings to persisted numeric IDs.
    */
   private async registerDevicesFromServerState(
     serverState: StartListeningResponse
@@ -650,7 +717,7 @@ export class EufySecurityProvider
       return;
     }
 
-    // Cache for use by getDevice() when creating station instances
+    // Cache for getDevice() fallback path.
     this.knownDeviceSerials = deviceSerials;
 
     const manifests = await Promise.all(
@@ -659,11 +726,20 @@ export class EufySecurityProvider
       )
     );
 
+    // Group manifests by providerNativeId and issue one onDevicesChanged per
+    // provider so Scrypted processes them atomically per parent.
+    const byProvider = new Map<string | undefined, typeof manifests>();
+    for (const manifest of manifests) {
+      const key = manifest.providerNativeId;
+      if (!byProvider.has(key)) byProvider.set(key, []);
+      byProvider.get(key)!.push(manifest);
+    }
+
     await Promise.all(
-      manifests.map((manifest) =>
+      Array.from(byProvider.entries()).map(([providerNativeId, group]) =>
         deviceManager.onDevicesChanged({
-          providerNativeId: manifest.providerNativeId,
-          devices: [manifest],
+          providerNativeId,
+          devices: group,
         })
       )
     );
